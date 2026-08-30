@@ -2853,6 +2853,11 @@ FFMPEG_LOG = "ffmpeg_error.log"
 #   "hevc_nvenc" = usually smaller at similar quality (still very fast on GPU)
 USE_HEVC = False
 
+# Encoder preference: "auto" probes NVENC and falls back to libx264 when no
+# usable NVIDIA encoder is available. Override per run with
+# TRACK_OVERLAY_ENCODER=nvenc or TRACK_OVERLAY_ENCODER=x264.
+VIDEO_ENCODER = os.environ.get("TRACK_OVERLAY_ENCODER", "auto").strip().lower()
+
 # NVENC speed/size knobs (p1 fastest .. p7 highest quality)
 NVENC_PRESET = "p2"  # try p1 or p2 for max speed
 NVENC_CQ = "23"  # higher = smaller file / lower quality (typical 18-28)
@@ -3007,7 +3012,58 @@ def _start_ffmpeg(encoder: str):
     return p, cmd, log_f
 
 
+def _nvenc_is_usable():
+    """Return True only when FFmpeg can encode a frame with NVENC."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+
+    codec = "hevc_nvenc" if USE_HEVC else "h264_nvenc"
+    width = height = 64
+    # One black yuv420p frame. Checking the encoder list alone is insufficient:
+    # FFmpeg may include NVENC while the host has no compatible NVIDIA device.
+    frame = bytes(width * height * 3 // 2)
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "rawvideo",
+        "-pix_fmt", "yuv420p",
+        "-s", f"{width}x{height}",
+        "-r", "1",
+        "-i", "pipe:0",
+        "-frames:v", "1",
+        "-c:v", codec,
+        "-f", "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            input=frame,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def open_writer_with_fallback():
+    if VIDEO_ENCODER not in {"auto", "nvenc", "x264"}:
+        raise ValueError(
+            "TRACK_OVERLAY_ENCODER must be one of: auto, nvenc, x264 "
+            f"(got {VIDEO_ENCODER!r})"
+        )
+
+    if VIDEO_ENCODER == "x264" or not _nvenc_is_usable():
+        if VIDEO_ENCODER != "x264":
+            print("NVENC unavailable. Using libx264 CPU encoding.")
+        p, cmd, log_f = _start_ffmpeg("x264")
+        return p, cmd, log_f, "x264"
+
     p, cmd, log_f = _start_ffmpeg("nvenc")
     time.sleep(0.25)
     if p.poll() is not None:

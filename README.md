@@ -66,6 +66,8 @@ The configured sample writes `GX010055Final.mp4`. Rendered `*Final.mp4` files an
 
 The default compressed-output profile preserves the source resolution while targeting a 7 Mbit/s H.264 video stream and 128 kbit/s AAC audio. Set `COMPRESS_OUTPUT = False` in the user configuration section if that profile is not desired.
 
+Encoder selection defaults to `auto`, which performs a small capability probe before using NVENC and otherwise selects `libx264`. Set `TRACK_OVERLAY_ENCODER=nvenc` or `TRACK_OVERLAY_ENCODER=x264` to request a specific encoder for a run.
+
 ## Configure another session
 
 The primary settings are grouped under `USER CONFIG` near the top of `newMain.py`:
