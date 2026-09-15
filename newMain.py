@@ -10,7 +10,7 @@ import cv2
 # ============================================================
 
 # --- Input / Output ---
-NUMS = ["GX010055"]
+NUMS = ["GX010055", "GX010056"]
 
 NUM = NUMS[0]  # base name for your per-session files (e.g. 2.mp4 + 2.csv)
 
@@ -1425,20 +1425,9 @@ def _build_minimap_base():
     y_m = y_m[main_mask]
     ln = ln[main_mask]
 
-    # --- Choose one representative lap (most points among laps with normal duration) to avoid multi-lap spaghetti ---
-    _valid_ln = np.isfinite(lap_lapnum) & (lap_lapnum >= 1)
-    _ln_ints = np.round(lap_lapnum[_valid_ln]).astype(int)
-    _ts = lap_t[_valid_ln]
-    _durations = {l: float(_ts[_ln_ints == l][-1] - _ts[_ln_ints == l][0]) for l in np.unique(_ln_ints)}
-    _valid_durs = [d for d in _durations.values() if 20.0 < d < 600.0]
-    _med_dur = float(np.median(_valid_durs)) if _valid_durs else 100.0
-
+    # --- Choose one representative lap (most points) to avoid multi-lap spaghetti ---
     uniq_ln, ln_cnt = np.unique(ln, return_counts=True)
-    valid_cands = [i for i, l in enumerate(uniq_ln) if l in _durations and 0.5 * _med_dur <= _durations[l] <= 1.5 * _med_dur]
-    if valid_cands:
-        rep_ln = int(uniq_ln[valid_cands[int(np.argmax(ln_cnt[valid_cands]))]])
-    else:
-        rep_ln = int(uniq_ln[int(np.argmax(ln_cnt))])
+    rep_ln = int(uniq_ln[int(np.argmax(ln_cnt))])
     rep_mask = (ln == rep_ln)
     if int(np.sum(rep_mask)) < 200:
         rep_mask = np.ones_like(ln, dtype=bool)
@@ -1582,20 +1571,32 @@ def _build_minimap_base():
         stride = int(np.ceil(len(pts_m) / 5000.0))
         pts_m = pts_m[::stride]
 
-    # --- Start/finish offset (roll centerline by meters) ---
+    # Optional: shift start/finish reference along the polyline (meters). Positive shifts forward.
+    if 'MINIMAP_SF_SHIFT_M' in globals() and MINIMAP_SF_SHIFT_M and len(pts_m) > 3:
+        _pm = np.asarray(pts_m, dtype=np.float64)
+        _seg = _pm[1:] - _pm[:-1]
+        _seglen = np.sqrt(np.sum(_seg * _seg, axis=1))
+        _cum = np.concatenate([[0.0], np.cumsum(_seglen)])
+        _total = float(_cum[-1]) if _cum[-1] > 1e-9 else 1.0
+        _shift = float(MINIMAP_SF_SHIFT_M) % _total
+        _k = int(np.searchsorted(_cum, _shift))
+        _k = max(0, min(_k, len(pts_m) - 1))
+        if _k > 0:
+            pts_m = np.roll(np.asarray(pts_m), -_k, axis=0)
+
+        # --- Start/finish offset (roll centerline by meters) ---
     if 'MINIMAP_SF_SHIFT_M' in globals() and MINIMAP_SF_SHIFT_M and abs(float(MINIMAP_SF_SHIFT_M)) > 1e-6:
-        if len(pts_m) > 1 and np.linalg.norm(pts_m[0] - pts_m[-1]) < 1e-6:
-            pts_m = pts_m[:-1]
+        # roll so that pts_m[0] corresponds to a point shifted along the loop by MINIMAP_SF_SHIFT_M meters
         dxy = np.diff(pts_m, axis=0, append=pts_m[:1])
         seg = np.hypot(dxy[:, 0], dxy[:, 1])
         cum = np.cumsum(seg)
         total = float(cum[-1]) if len(cum) else 0.0
         if total > 1e-6:
             shift = float(MINIMAP_SF_SHIFT_M) % total
+            # find first index where cumulative distance reaches shift
             idx = int(np.searchsorted(cum, shift, side='left')) % len(pts_m)
             if idx != 0:
                 pts_m = np.roll(pts_m, -idx, axis=0)
-        pts_m = np.vstack([pts_m, pts_m[0]])
 
     # Bounds for transform
     x = pts_m[:, 0]
@@ -2853,11 +2854,6 @@ FFMPEG_LOG = "ffmpeg_error.log"
 #   "hevc_nvenc" = usually smaller at similar quality (still very fast on GPU)
 USE_HEVC = False
 
-# Encoder preference: "auto" probes NVENC and falls back to libx264 when no
-# usable NVIDIA encoder is available. Override per run with
-# TRACK_OVERLAY_ENCODER=nvenc or TRACK_OVERLAY_ENCODER=x264.
-VIDEO_ENCODER = os.environ.get("TRACK_OVERLAY_ENCODER", "auto").strip().lower()
-
 # NVENC speed/size knobs (p1 fastest .. p7 highest quality)
 NVENC_PRESET = "p2"  # try p1 or p2 for max speed
 NVENC_CQ = "23"  # higher = smaller file / lower quality (typical 18-28)
@@ -3012,58 +3008,7 @@ def _start_ffmpeg(encoder: str):
     return p, cmd, log_f
 
 
-def _nvenc_is_usable():
-    """Return True only when FFmpeg can encode a frame with NVENC."""
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        return False
-
-    codec = "hevc_nvenc" if USE_HEVC else "h264_nvenc"
-    width = height = 64
-    # One black yuv420p frame. Checking the encoder list alone is insufficient:
-    # FFmpeg may include NVENC while the host has no compatible NVIDIA device.
-    frame = bytes(width * height * 3 // 2)
-    cmd = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel", "error",
-        "-f", "rawvideo",
-        "-pix_fmt", "yuv420p",
-        "-s", f"{width}x{height}",
-        "-r", "1",
-        "-i", "pipe:0",
-        "-frames:v", "1",
-        "-c:v", codec,
-        "-f", "null",
-        "-",
-    ]
-    try:
-        result = subprocess.run(
-            cmd,
-            input=frame,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
-
-
 def open_writer_with_fallback():
-    if VIDEO_ENCODER not in {"auto", "nvenc", "x264"}:
-        raise ValueError(
-            "TRACK_OVERLAY_ENCODER must be one of: auto, nvenc, x264 "
-            f"(got {VIDEO_ENCODER!r})"
-        )
-
-    if VIDEO_ENCODER == "x264" or not _nvenc_is_usable():
-        if VIDEO_ENCODER != "x264":
-            print("NVENC unavailable. Using libx264 CPU encoding.")
-        p, cmd, log_f = _start_ffmpeg("x264")
-        return p, cmd, log_f, "x264"
-
     p, cmd, log_f = _start_ffmpeg("nvenc")
     time.sleep(0.25)
     if p.poll() is not None:
@@ -3080,6 +3025,33 @@ def open_writer_with_fallback():
         p2, cmd2, log_f2 = _start_ffmpeg("x264")
         return p2, cmd2, log_f2, "x264"
     return p, cmd, log_f, ("hevc_nvenc" if USE_HEVC else "h264_nvenc")
+
+
+ffmpeg_proc, ffmpeg_cmd, ffmpeg_log_f, encoder_used = open_writer_with_fallback()
+print(f"Encoder: {encoder_used}")
+print(f"Output: {W}x{H} @ {fps:.3f} fps (matches source as-probed/OpenCV)")
+
+start_time = time.time()
+last_report_time = start_time
+last_report_frame = 0
+
+panel_w, panel_h = S(680), S(300)
+bar_w = S(28)
+gap = S(14)
+
+panel_x = W - S(20) - panel_w - bar_w - gap
+panel_y = H - S(20) - panel_h
+brake_x = panel_x - gap - bar_w
+throttle_x = panel_x + panel_w + gap
+
+rpmbar_x = brake_x
+rpmbar_w = (throttle_x + bar_w) - brake_x
+rpmbar_y = panel_y - S(70)
+
+tires_w = S(76 * 2 + 22 + 10)
+# tire panel is a 2x2 grid of square icons; height matches width
+
+tires_h = S(120 * 2 + 18)  # height for 2 rows of tires + gap; prevents RL/RR clipping
 
 
 def tempF(key, t_sample):
@@ -3123,333 +3095,294 @@ else:
     _TEXT_EVERY_N = 1
     _lap_text_cache = None
 
-def render_video():
-    global CURRENT_FRAME_I, _split_render_start_unix, _split_ready, _split_last_bi, _prog_hint_seg, _split_base_prog, _prev_lap_delta_s, _split_best_lap_s, _minimap_centerline_active, _dot_last_px, _dot_smooth_px, _dot_last_proj_m, _dot_last_prog, _dot_last_dir_px, _split_run_prev_p, _fused_prog, _fused_unix, _fused_locked, _fused_lock_t0, _fused_last_gps_p, _fused_gps_sane_count, _fused_centerline_ok_count, _minimap_rc_last_accept_p, _minimap_rc_last_accept_unix, _minimap_rc_disp_p, _prog_last, _prog_last_unix, _prog_last_xy_m, _prog_last_accept, _prog_pending_p, _prog_pending_xy_m, _prog_pending_count, cap
+i = 0
+print("Starting render loop...")
+# Decode frames via ffmpeg pipe (much faster + reliable seeking vs OpenCV on Windows)
+ffdec_proc, ff_read_frame = start_ffmpeg_frame_reader(VIDEO_IN, W, H, fps, trim_start_s)
 
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(VIDEO_IN)
-        if trim_start_s > 0.0:
-            start_frame = int(round(trim_start_s * fps))
-            if not cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame):
-                cap.set(cv2.CAP_PROP_POS_MSEC, trim_start_s * 1000.0)
+_first_frame_written = False
+while True:
+    if i >= max_frames:
+        break
 
-    ffmpeg_proc, ffmpeg_cmd, ffmpeg_log_f, encoder_used = open_writer_with_fallback()
-    print(f"Encoder: {encoder_used}")
-    print(f"Output: {W}x{H} @ {fps:.3f} fps (matches source as-probed/OpenCV)")
+    frame = ff_read_frame()
+    if frame is None:
+        break
 
-    start_time = time.time()
-    last_report_time = start_time
-    last_report_frame = 0
+        print(f"...working (frame {i})", flush=True)
 
-    panel_w, panel_h = S(680), S(300)
-    bar_w = S(28)
-    gap = S(14)
+    # Output time starts at 0 at VIDEO_TRIM_START_S
+    t_out = i / fps
+    CURRENT_FRAME_I = i
+    t_src = trim_start_s + t_out
 
-    panel_x = W - S(20) - panel_w - bar_w - gap
-    panel_y = H - S(20) - panel_h
-    brake_x = panel_x - gap - bar_w
-    throttle_x = panel_x + panel_w + gap
+    # Main log sampling uses OUTPUT time base (0 at trimmed start)
+    t_sample = MAIN_START_S + t_out
 
-    rpmbar_x = brake_x
-    rpmbar_w = (throttle_x + bar_w) - brake_x
-    rpmbar_y = panel_y - S(70)
+    rpm = v("rpm", t_sample)
 
-    tires_w = S(76 * 2 + 22 + 10)
-    # tire panel is a 2x2 grid of square icons; height matches width
+    tps_raw = v("tps", t_sample)
+    tps = (tps_raw / SCALE["tps"]) if np.isfinite(tps_raw) else 0.0
+    tps = float(np.clip(tps, 0.0, 100.0))
 
-    tires_h = S(120 * 2 + 18)  # height for 2 rows of tires + gap; prevents RL/RR clipping
+    brake = (CHANNEL_CACHE.get('__brake_pct')[i] if (FAST_RENDER and '__brake_pct' in CHANNEL_CACHE) else brake_pct_at(
+        t_sample))
 
-    i = 0
-    print("Starting render loop...")
-    # Decode frames via ffmpeg pipe (much faster + reliable seeking vs OpenCV on Windows)
-    ffdec_proc, ff_read_frame = start_ffmpeg_frame_reader(VIDEO_IN, W, H, fps, trim_start_s)
+    speed_raw = v("speed", t_sample)
+    speed_kph = (speed_raw / SCALE["speed"]) if np.isfinite(speed_raw) else np.nan
+    mph = (speed_kph * KPH_TO_MPH) if np.isfinite(speed_kph) else np.nan
 
-    _first_frame_written = False
-    while True:
-        if i >= max_frames:
-            break
+    map_raw = v("map", t_sample)
+    map_kpa_abs = (map_raw / SCALE["kpa"]) if np.isfinite(map_raw) else np.nan
+    map_psi_abs = kpa_to_psi(map_kpa_abs) if np.isfinite(map_kpa_abs) else np.nan
+    map_psig = psi_abs_to_psig(map_psi_abs) if np.isfinite(map_psi_abs) else np.nan
 
-        frame = ff_read_frame()
-        if frame is None:
-            break
+    fp_raw = v("fuel_p", t_sample)
+    fpe_raw = v("fuel_p_exp", t_sample)
+    fp_kpa_abs = (fp_raw / SCALE["fuel_kpa"]) if np.isfinite(fp_raw) else np.nan
+    fpe_kpa_abs = (fpe_raw / SCALE["fuel_kpa_exp"]) if np.isfinite(fpe_raw) else np.nan
+    fp_psi_abs = kpa_to_psi(fp_kpa_abs) if np.isfinite(fp_kpa_abs) else np.nan
+    fpe_psi_abs = kpa_to_psi(fpe_kpa_abs) if np.isfinite(fpe_kpa_abs) else np.nan
+    fp_psig = psi_abs_to_psig(fp_psi_abs) if np.isfinite(fp_psi_abs) else np.nan
+    fpe_psig = psi_abs_to_psig(fpe_psi_abs) if np.isfinite(fpe_psi_abs) else np.nan
+    if np.isfinite(fp_psig): fp_psig = max(0.0, fp_psig)
+    if np.isfinite(fpe_psig): fpe_psig = max(0.0, fpe_psig)
 
-            print(f"...working (frame {i})", flush=True)
+    if np.isfinite(fp_psig) and np.isfinite(fpe_psig) and abs(fpe_psig) > 1e-6:
+        diff_pct = (fp_psig - fpe_psig) / fpe_psig * 100.0
+        fuel_pct = f"{diff_pct:+0.1f}%"
+    else:
+        fuel_pct = ""
 
-        # Output time starts at 0 at VIDEO_TRIM_START_S
-        t_out = i / fps
-        CURRENT_FRAME_I = i
-        t_src = trim_start_s + t_out
+    clt = tempF("clt", t_sample)
+    iat = tempF("iat", t_sample)
+    oil = tempF("oil_temp", t_sample)
 
-        # Main log sampling uses OUTPUT time base (0 at trimmed start)
-        t_sample = MAIN_START_S + t_out
+    wb1 = v("wb1", t_sample)
+    wb2 = v("wb2", t_sample)
+    lt = v("lambda_tgt", t_sample)
+    wb1 = (wb1 / SCALE["lambda"]) if np.isfinite(wb1) else np.nan
+    wb2 = (wb2 / SCALE["lambda"]) if np.isfinite(wb2) else np.nan
+    lt = (lt / SCALE["lambda"]) if np.isfinite(lt) else np.nan
 
-        rpm = v("rpm", t_sample)
+    gear_raw = v("gear", t_sample)
 
-        tps_raw = v("tps", t_sample)
-        tps = (tps_raw / SCALE["tps"]) if np.isfinite(tps_raw) else 0.0
-        tps = float(np.clip(tps, 0.0, 100.0))
+    ign_raw = v("ign", t_sample)
+    knock_raw = v("knock", t_sample)
+    ign = (ign_raw / IGN_SCALE) if np.isfinite(ign_raw) else np.nan
+    knock = (knock_raw / KNOCK_SCALE) if np.isfinite(knock_raw) else np.nan
 
-        brake = (CHANNEL_CACHE.get('__brake_pct')[i] if (FAST_RENDER and '__brake_pct' in CHANNEL_CACHE) else brake_pct_at(
-            t_sample))
+    data = {
+        "rpm": f"{rpm:0.0f}" if np.isfinite(rpm) else "--",
+        "gear": f"{int(gear_raw)}" if np.isfinite(gear_raw) else "--",
+        "mph": f"{mph:0.1f}" if np.isfinite(mph) else "--",
+        "map": f"{map_psig:0.1f} psi" if np.isfinite(map_psig) else "--",
+        "clt": f"{clt:0.0f}F" if np.isfinite(clt) else "--",
+        "oil": f"{oil:0.0f}F" if np.isfinite(oil) else "--",
+        "iat": f"{iat:0.0f}F" if np.isfinite(iat) else "--",
+        "tps": f"{tps:0.0f}%",
+        "fuel_psi": f"{fp_psig:0.1f} psi" if np.isfinite(fp_psig) else "--",
+        "fuel_pct": fuel_pct,
+        "wb": f"{wb1:0.2f}/{wb2:0.2f}" if np.isfinite(wb1) and np.isfinite(wb2) else "--",
+        "lt": f"{lt:0.2f}" if np.isfinite(lt) else "--",
+        "ign": f"Ign {ign:0.1f}" if np.isfinite(ign) else "Ign --",
+        "knock": f"Knock {int(round(knock))}" if np.isfinite(knock) else "Knock --",
+    }
 
-        speed_raw = v("speed", t_sample)
-        speed_kph = (speed_raw / SCALE["speed"]) if np.isfinite(speed_raw) else np.nan
-        mph = (speed_kph * KPH_TO_MPH) if np.isfinite(speed_kph) else np.nan
+    vals = {
+        "t_fl": v("t_fl", t_sample), "t_fr": v("t_fr", t_sample),
+        "t_rl": v("t_rl", t_sample), "t_rr": v("t_rr", t_sample),
+        "p_fl": v("p_fl", t_sample), "p_fr": v("p_fr", t_sample),
+        "p_rl": v("p_rl", t_sample), "p_rr": v("p_rr", t_sample),
+    }
 
-        map_raw = v("map", t_sample)
-        map_kpa_abs = (map_raw / SCALE["kpa"]) if np.isfinite(map_raw) else np.nan
-        map_psi_abs = kpa_to_psi(map_kpa_abs) if np.isfinite(map_kpa_abs) else np.nan
-        map_psig = psi_abs_to_psig(map_psi_abs) if np.isfinite(map_psi_abs) else np.nan
-
-        fp_raw = v("fuel_p", t_sample)
-        fpe_raw = v("fuel_p_exp", t_sample)
-        fp_kpa_abs = (fp_raw / SCALE["fuel_kpa"]) if np.isfinite(fp_raw) else np.nan
-        fpe_kpa_abs = (fpe_raw / SCALE["fuel_kpa_exp"]) if np.isfinite(fpe_raw) else np.nan
-        fp_psi_abs = kpa_to_psi(fp_kpa_abs) if np.isfinite(fp_kpa_abs) else np.nan
-        fpe_psi_abs = kpa_to_psi(fpe_kpa_abs) if np.isfinite(fpe_kpa_abs) else np.nan
-        fp_psig = psi_abs_to_psig(fp_psi_abs) if np.isfinite(fp_psi_abs) else np.nan
-        fpe_psig = psi_abs_to_psig(fpe_psi_abs) if np.isfinite(fpe_psi_abs) else np.nan
-        if np.isfinite(fp_psig): fp_psig = max(0.0, fp_psig)
-        if np.isfinite(fpe_psig): fpe_psig = max(0.0, fpe_psig)
-
-        if np.isfinite(fp_psig) and np.isfinite(fpe_psig) and abs(fpe_psig) > 1e-6:
-            diff_pct = (fp_psig - fpe_psig) / fpe_psig * 100.0
-            fuel_pct = f"{diff_pct:+0.1f}%"
-        else:
-            fuel_pct = ""
-
-        clt = tempF("clt", t_sample)
-        iat = tempF("iat", t_sample)
-        oil = tempF("oil_temp", t_sample)
-
-        wb1 = v("wb1", t_sample)
-        wb2 = v("wb2", t_sample)
-        lt = v("lambda_tgt", t_sample)
-        wb1 = (wb1 / SCALE["lambda"]) if np.isfinite(wb1) else np.nan
-        wb2 = (wb2 / SCALE["lambda"]) if np.isfinite(wb2) else np.nan
-        lt = (lt / SCALE["lambda"]) if np.isfinite(lt) else np.nan
-
-        gear_raw = v("gear", t_sample)
-
-        ign_raw = v("ign", t_sample)
-        knock_raw = v("knock", t_sample)
-        ign = (ign_raw / IGN_SCALE) if np.isfinite(ign_raw) else np.nan
-        knock = (knock_raw / KNOCK_SCALE) if np.isfinite(knock_raw) else np.nan
-
-        data = {
-            "rpm": f"{rpm:0.0f}" if np.isfinite(rpm) else "--",
-            "gear": f"{int(gear_raw)}" if np.isfinite(gear_raw) else "--",
-            "mph": f"{mph:0.1f}" if np.isfinite(mph) else "--",
-            "map": f"{map_psig:0.1f} psi" if np.isfinite(map_psig) else "--",
-            "clt": f"{clt:0.0f}F" if np.isfinite(clt) else "--",
-            "oil": f"{oil:0.0f}F" if np.isfinite(oil) else "--",
-            "iat": f"{iat:0.0f}F" if np.isfinite(iat) else "--",
-            "tps": f"{tps:0.0f}%",
-            "fuel_psi": f"{fp_psig:0.1f} psi" if np.isfinite(fp_psig) else "--",
-            "fuel_pct": fuel_pct,
-            "wb": f"{wb1:0.2f}/{wb2:0.2f}" if np.isfinite(wb1) and np.isfinite(wb2) else "--",
-            "lt": f"{lt:0.2f}" if np.isfinite(lt) else "--",
-            "ign": f"Ign {ign:0.1f}" if np.isfinite(ign) else "Ign --",
-            "knock": f"Knock {int(round(knock))}" if np.isfinite(knock) else "Knock --",
-        }
-
-        vals = {
-            "t_fl": v("t_fl", t_sample), "t_fr": v("t_fr", t_sample),
-            "t_rl": v("t_rl", t_sample), "t_rr": v("t_rr", t_sample),
-            "p_fl": v("p_fl", t_sample), "p_fr": v("p_fr", t_sample),
-            "p_rl": v("p_rl", t_sample), "p_rr": v("p_rr", t_sample),
-        }
-
-        draw_panel_roi(frame, panel_x, panel_y, panel_w, panel_h, draw_bottom_right, data, 0, 0, panel_w, panel_h)
-        draw_bar(frame, brake, brake_x, panel_y, bar_w, panel_h, (0, 0, 255))
-        draw_bar(frame, tps, throttle_x, panel_y, bar_w, panel_h, (0, 255, 0))
-        draw_rpm_bar(frame, rpm, rpmbar_x, rpmbar_y, rpmbar_w, S(54))
-        draw_panel_roi(frame, W - tires_w - S(20), S(20), tires_w, tires_h, draw_tires, vals, 0, 0, SCALE["temp_k"],
-                       SCALE["tire_kpa"])
-        lap_time_s, prev_lap_s, sess_best_s, lat_g, lon_g, gps_lat_deg, gps_lon_deg = lap_at_time(t_sample, t_out)
-        # ----- Split computation (delta vs current session-best lap at same track progress) -----
-        t_unix_now = t_sample + LAP_SYNC_OFFSET
-        speed_mps_now = (mph * 0.44704) if np.isfinite(mph) else None
-        if _split_render_start_unix is None:
-            # Only show splits after we have a FULL completed lap that starts after the rendered segment begins.
-            _split_render_start_unix = float(t_unix_now)
-            _split_ready = False
-        # determine current session segment index
-        bi_now = int(np.searchsorted(session_boundaries_unix, t_unix_now, side='right') - 1)
-        if bi_now < 0:
-            bi_now = 0
-        if bi_now >= len(session_boundaries_unix):
-            bi_now = len(session_boundaries_unix) - 1
-        # elapsed time since start of this session/lap segment (stable even if video starts mid-lap)
-        seg_time_s = float(max(0.0, t_unix_now - float(session_boundaries_unix[bi_now])))
-        if _split_last_bi is None:
-            _split_last_bi = bi_now
-            _prog_hint_seg = None
-            _split_base_prog = _progress_from_gps(gps_lat_deg, gps_lon_deg)
-            _reset_virtual_splits()
-        # if we crossed into a new segment, the previous one is now complete (except the final win_end segment)
-        if bi_now != _split_last_bi:
-            ended = _split_last_bi
-            # ended segment is [boundary[ended], boundary[ended+1]] if it exists
-            if 0 <= ended < (len(session_boundaries_unix) - 2):
+    draw_panel_roi(frame, panel_x, panel_y, panel_w, panel_h, draw_bottom_right, data, 0, 0, panel_w, panel_h)
+    draw_bar(frame, brake, brake_x, panel_y, bar_w, panel_h, (0, 0, 255))
+    draw_bar(frame, tps, throttle_x, panel_y, bar_w, panel_h, (0, 255, 0))
+    draw_rpm_bar(frame, rpm, rpmbar_x, rpmbar_y, rpmbar_w, S(54))
+    draw_panel_roi(frame, W - tires_w - S(20), S(20), tires_w, tires_h, draw_tires, vals, 0, 0, SCALE["temp_k"],
+                   SCALE["tire_kpa"])
+    lap_time_s, prev_lap_s, sess_best_s, lat_g, lon_g, gps_lat_deg, gps_lon_deg = lap_at_time(t_sample, t_out)
+    # ----- Split computation (delta vs current session-best lap at same track progress) -----
+    t_unix_now = t_sample + LAP_SYNC_OFFSET
+    speed_mps_now = (mph * 0.44704) if np.isfinite(mph) else None
+    if _split_render_start_unix is None:
+        # Only show splits after we have a FULL completed lap that starts after the rendered segment begins.
+        _split_render_start_unix = float(t_unix_now)
+        _split_ready = False
+    # determine current session segment index
+    bi_now = int(np.searchsorted(session_boundaries_unix, t_unix_now, side='right') - 1)
+    if bi_now < 0:
+        bi_now = 0
+    if bi_now >= len(session_boundaries_unix):
+        bi_now = len(session_boundaries_unix) - 1
+    # elapsed time since start of this session/lap segment (stable even if video starts mid-lap)
+    seg_time_s = float(max(0.0, t_unix_now - float(session_boundaries_unix[bi_now])))
+    if _split_last_bi is None:
+        _split_last_bi = bi_now
+        _prog_hint_seg = None
+        _split_base_prog = _progress_from_gps(gps_lat_deg, gps_lon_deg)
+        _reset_virtual_splits()
+    # if we crossed into a new segment, the previous one is now complete (except the final win_end segment)
+    if bi_now != _split_last_bi:
+        ended = _split_last_bi
+        # ended segment is [boundary[ended], boundary[ended+1]] if it exists
+        if 0 <= ended < (len(session_boundaries_unix) - 2):
+            t0 = float(session_boundaries_unix[ended])
+            t1 = float(session_boundaries_unix[ended + 1])
+            dur = t1 - t0
+            # Only accept a reference lap if it is a *FULL LAP segment* inside the rendered window.
+            # Full laps are segments 1..(len(boundaries)-3). Segment 0 is the initial partial lap (win_start -> first lap boundary),
+            # and the last segment is the final partial lap (last lap boundary -> win_end).
+            if (ended >= 1) and (ended < (len(session_boundaries_unix) - 2)):
                 t0 = float(session_boundaries_unix[ended])
                 t1 = float(session_boundaries_unix[ended + 1])
                 dur = t1 - t0
-                # Only accept a reference lap if it is a *FULL LAP segment* inside the rendered window.
-                # Full laps are segments 1..(len(boundaries)-3). Segment 0 is the initial partial lap (win_start -> first lap boundary),
-                # and the last segment is the final partial lap (last lap boundary -> win_end).
-                if (ended >= 1) and (ended < (len(session_boundaries_unix) - 2)):
-                    t0 = float(session_boundaries_unix[ended])
-                    t1 = float(session_boundaries_unix[ended + 1])
-                    dur = t1 - t0
-                    # update ref only if this completed full lap is the new session best
-                    best_before = float(_split_best_lap_s)
-                    # Store last-lap delta vs the session best *before* updating (so improvements show as negative).
-                    if np.isfinite(best_before):
-                        _prev_lap_delta_s = float(dur) - best_before
-                    else:
-                        _prev_lap_delta_s = 0.0
-
-                    # If this completed full lap is the new session best, update the reference
-                    if dur > 20.0 and dur < 600.0 and dur < _split_best_lap_s:
-                        _split_best_lap_s = float(dur)
-                        _make_split_reference(t0, t1)
-                        _split_ready = (_split_ref_prog is not None) and (_split_ref_time is not None)
-            _split_last_bi = bi_now
-            _prog_hint_seg = None
-            _split_base_prog = _progress_from_gps(gps_lat_deg, gps_lon_deg)
-            _reset_virtual_splits()
-        # compute current split (virtual splits by default)
-        split_s = np.nan
-        split_idx = 0
-        rel_p = np.nan
-        if _split_ready and (_split_ref_prog is not None) and (_split_ref_time is not None) and np.isfinite(lap_time_s):
-            raw_p = _progress_from_gps(gps_lat_deg, gps_lon_deg)
-            if np.isfinite(raw_p) and np.isfinite(_split_base_prog):
-                rel_p = raw_p - float(_split_base_prog)
-                if rel_p < 0.0:
-                    rel_p += 1.0
-                # clamp into [0,1]
-                rel_p = float(max(0.0, min(1.0, rel_p)))
-                # Smooth/monotonic progress for *running* split display (prevents oscillation after lap 1)
-                rel_p_use = _filter_running_rel_p(rel_p, speed_mps_now, 1.0 / float(fps if fps else 30.0)) if VIRTUAL_SPLITS_RUNNING else rel_p
-                # Early-lap sanity: if projection is still "stuck" near some later part of the lap right after SF,
-                # the running split can show huge negatives (e.g. -25s). Detect and reset the split base in that case.
-                if lap_time_s < 6.0 and rel_p_use > 0.15:
-                    # Treat current raw progress as the new lap start reference.
-                    _split_base_prog = float(raw_p)
-                    rel_p = 0.0
-                    rel_p_use = 0.0
-                    _split_run_prev_p = np.nan
-                ref_t_now = float(np.interp(rel_p_use, _split_ref_prog, _split_ref_time))
-                # Running delta vs session-best at current progress (stable; avoids impossible huge +/- values)
-                # Use lap_time_s (elapsed since lap start) vs reference lap elapsed at rel_p_use.
-                split_s = float(lap_time_s - ref_t_now)
-                # Sanity: if split delta is wildly large early in a lap, rel_p_use likely wrapped to the wrong
-                # part of the centerline. Rebase the running-split progress so we don't show impossible values
-                # like -25s right after the start/finish.
-                if np.isfinite(split_s) and (abs(split_s) > SPLIT_SANITY_MAX_ABS_S) and (lap_time_s < SPLIT_SANITY_MAX_LAP_T_S):
-                    _split_base_prog = float(raw_p)
-                    rel_p = 0.0
-                    rel_p_use = 0.0
-                    _split_run_prev_p = np.nan
-                    ref_t_now = 0.0
-                    split_s = float(lap_time_s)
-                if VIRTUAL_SPLITS_ENABLE and (VIRTUAL_SPLITS_N is not None) and int(VIRTUAL_SPLITS_N) > 1:
-                    N = int(VIRTUAL_SPLITS_N)
-                    if VIRTUAL_SPLITS_RUNNING:
-                        # Show which split/sector we're currently IN (1..N)
-                        split_idx = int(min(N - 1, max(0, int(rel_p_use * N)))) + 1
-                    else:
-                        # Old behavior: show last passed split only
-                        split_idx, split_s = _update_virtual_splits(rel_p, float(seg_time_s))
-        # Update expensive lap/G text at a lower rate (looks identical, much faster)
-        if FAST_RENDER and (_TEXT_EVERY_N > 1) and (i % _TEXT_EVERY_N == 0):
-            _lap_text_cache["lap"] = f"Lap  {_fmt_laptime(lap_time_s)}"
-            _lap_text_cache["prev"] = f"Prev {_fmt_laptime(prev_lap_s)}"
-            # Split display: hide until we have a completed reference lap (no splits on first lap)
-            if not _split_ready:
-                _lap_text_cache["split"] = "Split --.--"
-            else:
-                if VIRTUAL_SPLITS_ENABLE and (VIRTUAL_SPLITS_N is not None) and int(VIRTUAL_SPLITS_N) > 1:
-                    N = int(VIRTUAL_SPLITS_N)
-                    # Running split: show current sector index (1..N) and delta at current progress
-                    if np.isfinite(split_s):
-                        split_sign = "-" if split_s < 0 else "+" if split_s > 0 else " "
-                        _lap_text_cache["split"] = f"S{int(split_idx)}/{N}  {split_sign}{abs(split_s):0.2f}"
-                    else:
-                        _lap_text_cache["split"] = f"S{int(split_idx)}/{N}  --.--"
+                # update ref only if this completed full lap is the new session best
+                best_before = float(_split_best_lap_s)
+                # Store last-lap delta vs the session best *before* updating (so improvements show as negative).
+                if np.isfinite(best_before):
+                    _prev_lap_delta_s = float(dur) - best_before
                 else:
-                    if np.isfinite(split_s):
-                        split_sign = "-" if split_s < 0 else "+" if split_s > 0 else " "
-                        _lap_text_cache["split"] = f"Split {split_sign}{abs(split_s):0.2f}"
-                    else:
-                        _lap_text_cache["split"] = "Split --.--"
-            _lap_text_cache["sess"] = f"Sess best {_fmt_laptime(sess_best_s)}"
-            _lap_text_cache["day"] = f"Day best  {_fmt_laptime(DAY_BEST_LAP_S)}"
-            if np.isfinite(lat_g) and np.isfinite(lon_g):
-                g_mag = math.sqrt(float(lat_g) * float(lat_g) + float(lon_g) * float(lon_g))
-                _lap_text_cache["g_main"] = f"{g_mag:0.2f}g"
-                _lap_text_cache["g_lat"] = f"Lat {float(lat_g):+0.2f}g"
-                _lap_text_cache["g_lon"] = f"Lon {float(lon_g):+0.2f}g"
+                    _prev_lap_delta_s = 0.0
+
+                # If this completed full lap is the new session best, update the reference
+                if dur > 20.0 and dur < 600.0 and dur < _split_best_lap_s:
+                    _split_best_lap_s = float(dur)
+                    _make_split_reference(t0, t1)
+                    _split_ready = (_split_ref_prog is not None) and (_split_ref_time is not None)
+        _split_last_bi = bi_now
+        _prog_hint_seg = None
+        _split_base_prog = _progress_from_gps(gps_lat_deg, gps_lon_deg)
+        _reset_virtual_splits()
+    # compute current split (virtual splits by default)
+    split_s = np.nan
+    split_idx = 0
+    rel_p = np.nan
+    if _split_ready and (_split_ref_prog is not None) and (_split_ref_time is not None) and np.isfinite(lap_time_s):
+        raw_p = _progress_from_gps(gps_lat_deg, gps_lon_deg)
+        if np.isfinite(raw_p) and np.isfinite(_split_base_prog):
+            rel_p = raw_p - float(_split_base_prog)
+            if rel_p < 0.0:
+                rel_p += 1.0
+            # clamp into [0,1]
+            rel_p = float(max(0.0, min(1.0, rel_p)))
+            # Smooth/monotonic progress for *running* split display (prevents oscillation after lap 1)
+            rel_p_use = _filter_running_rel_p(rel_p, speed_mps_now, 1.0 / float(fps if fps else 30.0)) if VIRTUAL_SPLITS_RUNNING else rel_p
+            # Early-lap sanity: if projection is still "stuck" near some later part of the lap right after SF,
+            # the running split can show huge negatives (e.g. -25s). Detect and reset the split base in that case.
+            if lap_time_s < 6.0 and rel_p_use > 0.15:
+                # Treat current raw progress as the new lap start reference.
+                _split_base_prog = float(raw_p)
+                rel_p = 0.0
+                rel_p_use = 0.0
+                _split_run_prev_p = np.nan
+            ref_t_now = float(np.interp(rel_p_use, _split_ref_prog, _split_ref_time))
+            # Running delta vs session-best at current progress (stable; avoids impossible huge +/- values)
+            # Use lap_time_s (elapsed since lap start) vs reference lap elapsed at rel_p_use.
+            split_s = float(lap_time_s - ref_t_now)
+            # Sanity: if split delta is wildly large early in a lap, rel_p_use likely wrapped to the wrong
+            # part of the centerline. Rebase the running-split progress so we don't show impossible values
+            # like -25s right after the start/finish.
+            if np.isfinite(split_s) and (abs(split_s) > SPLIT_SANITY_MAX_ABS_S) and (lap_time_s < SPLIT_SANITY_MAX_LAP_T_S):
+                _split_base_prog = float(raw_p)
+                rel_p = 0.0
+                rel_p_use = 0.0
+                _split_run_prev_p = np.nan
+                ref_t_now = 0.0
+                split_s = float(lap_time_s)
+            if VIRTUAL_SPLITS_ENABLE and (VIRTUAL_SPLITS_N is not None) and int(VIRTUAL_SPLITS_N) > 1:
+                N = int(VIRTUAL_SPLITS_N)
+                if VIRTUAL_SPLITS_RUNNING:
+                    # Show which split/sector we're currently IN (1..N)
+                    split_idx = int(min(N - 1, max(0, int(rel_p_use * N)))) + 1
+                else:
+                    # Old behavior: show last passed split only
+                    split_idx, split_s = _update_virtual_splits(rel_p, float(seg_time_s))
+    # Update expensive lap/G text at a lower rate (looks identical, much faster)
+    if FAST_RENDER and (_TEXT_EVERY_N > 1) and (i % _TEXT_EVERY_N == 0):
+        _lap_text_cache["lap"] = f"Lap  {_fmt_laptime(lap_time_s)}"
+        _lap_text_cache["prev"] = f"Prev {_fmt_laptime(prev_lap_s)}"
+        # Split display: hide until we have a completed reference lap (no splits on first lap)
+        if not _split_ready:
+            _lap_text_cache["split"] = "Split --.--"
+        else:
+            if VIRTUAL_SPLITS_ENABLE and (VIRTUAL_SPLITS_N is not None) and int(VIRTUAL_SPLITS_N) > 1:
+                N = int(VIRTUAL_SPLITS_N)
+                # Running split: show current sector index (1..N) and delta at current progress
+                if np.isfinite(split_s):
+                    split_sign = "-" if split_s < 0 else "+" if split_s > 0 else " "
+                    _lap_text_cache["split"] = f"S{int(split_idx)}/{N}  {split_sign}{abs(split_s):0.2f}"
+                else:
+                    _lap_text_cache["split"] = f"S{int(split_idx)}/{N}  --.--"
             else:
-                _lap_text_cache["g_main"] = "--.--g"
-                _lap_text_cache["g_lat"] = "Lat --.--g"
-                _lap_text_cache["g_lon"] = "Lon --.--g"
+                if np.isfinite(split_s):
+                    split_sign = "-" if split_s < 0 else "+" if split_s > 0 else " "
+                    _lap_text_cache["split"] = f"Split {split_sign}{abs(split_s):0.2f}"
+                else:
+                    _lap_text_cache["split"] = "Split --.--"
+        _lap_text_cache["sess"] = f"Sess best {_fmt_laptime(sess_best_s)}"
+        _lap_text_cache["day"] = f"Day best  {_fmt_laptime(DAY_BEST_LAP_S)}"
+        if np.isfinite(lat_g) and np.isfinite(lon_g):
+            g_mag = math.sqrt(float(lat_g) * float(lat_g) + float(lon_g) * float(lon_g))
+            _lap_text_cache["g_main"] = f"{g_mag:0.2f}g"
+            _lap_text_cache["g_lat"] = f"Lat {float(lat_g):+0.2f}g"
+            _lap_text_cache["g_lon"] = f"Lon {float(lon_g):+0.2f}g"
+        else:
+            _lap_text_cache["g_main"] = "--.--g"
+            _lap_text_cache["g_lat"] = "Lat --.--g"
+            _lap_text_cache["g_lon"] = "Lon --.--g"
 
-        draw_lap_panel(frame, lap_time_s, prev_lap_s, sess_best_s, split_s, lat_g, lon_g,
-                       txt_cache=_lap_text_cache if FAST_RENDER else None)
-        draw_minimap(frame, gps_lat_deg, gps_lon_deg, t_unix=t_sample, speed_mps=speed_mps_now)
+    draw_lap_panel(frame, lap_time_s, prev_lap_s, sess_best_s, split_s, lat_g, lon_g,
+                   txt_cache=_lap_text_cache if FAST_RENDER else None)
+    draw_minimap(frame, gps_lat_deg, gps_lon_deg, t_unix=t_sample, speed_mps=speed_mps_now)
 
-        # Write frame to ffmpeg stdin (must be contiguous bytes)
-        frame_bytes = memoryview(np.ascontiguousarray(frame)).cast("B")
-        try:
-            ffmpeg_proc.stdin.write(frame_bytes)
-            if not _first_frame_written:
-                _first_frame_written = True
-                print("First frame written to encoder.", flush=True)
-        except (BrokenPipeError, OSError) as e:
-            rc = ffmpeg_proc.poll()
-            raise RuntimeError(f"ffmpeg write failed: {e} (returncode={rc}). See {FFMPEG_LOG}. Command: {ffmpeg_cmd}")
-
-        # progress once per second of video
-        if max_frames > 0 and (i % int(max(1, fps)) == 0):
-            now = time.time()
-            elapsed = now - start_time
-            progress = (i + 1) / max_frames
-            eta = (elapsed / progress) - elapsed if progress > 0 else 0.0
-            dt = now - last_report_time
-            frame_delta = (i + 1) - last_report_frame
-            proc_fps = (frame_delta / dt) if dt > 1e-6 else 0.0
-            print(
-                f"\rProcessing: {progress * 100:5.1f}% | Frame {i + 1}/{max_frames} | Proc {proc_fps:5.1f} fps | ETA {eta / 60:5.1f} min",
-                end="", flush=True)
-            last_report_time = now
-            last_report_frame = (i + 1)
-
-        i += 1
-
-    cap.release()
-
-    # Close ffmpeg stdin and wait for encode to finish
+    # Write frame to ffmpeg stdin (must be contiguous bytes)
+    frame_bytes = memoryview(np.ascontiguousarray(frame)).cast("B")
     try:
-        ffmpeg_proc.stdin.close()
-    except Exception:
-        pass
-    rc = ffmpeg_proc.wait()
-    try:
-        ffmpeg_log_f.close()
-    except Exception:
-        pass
+        ffmpeg_proc.stdin.write(frame_bytes)
+        if not _first_frame_written:
+            _first_frame_written = True
+            print("First frame written to encoder.", flush=True)
+    except (BrokenPipeError, OSError) as e:
+        rc = ffmpeg_proc.poll()
+        raise RuntimeError(f"ffmpeg write failed: {e} (returncode={rc}). See {FFMPEG_LOG}. Command: {ffmpeg_cmd}")
 
-    if rc != 0:
-        print("\nffmpeg failed. See ffmpeg_error.log for details.")
-        raise SystemExit(1)
+    # progress once per second of video
+    if max_frames > 0 and (i % int(max(1, fps)) == 0):
+        now = time.time()
+        elapsed = now - start_time
+        progress = (i + 1) / max_frames
+        eta = (elapsed / progress) - elapsed if progress > 0 else 0.0
+        dt = now - last_report_time
+        frame_delta = (i + 1) - last_report_frame
+        proc_fps = (frame_delta / dt) if dt > 1e-6 else 0.0
+        print(
+            f"\rProcessing: {progress * 100:5.1f}% | Frame {i + 1}/{max_frames} | Proc {proc_fps:5.1f} fps | ETA {eta / 60:5.1f} min",
+            end="", flush=True)
+        last_report_time = now
+        last_report_frame = (i + 1)
 
-    elapsed_total = time.time() - start_time
-    print("\nRender complete (with audio).")
-    print("Output written to:", VIDEO_OUT)
-    print(f"Total time: {elapsed_total / 60:.2f} min")
+    i += 1
 
-if __name__ == "__main__":
-    render_video()
+cap.release()
+
+# Close ffmpeg stdin and wait for encode to finish
+try:
+    ffmpeg_proc.stdin.close()
+except Exception:
+    pass
+rc = ffmpeg_proc.wait()
+try:
+    ffmpeg_log_f.close()
+except Exception:
+    pass
+
+if rc != 0:
+    print("\nffmpeg failed. See ffmpeg_error.log for details.")
+    raise SystemExit(1)
+
+elapsed_total = time.time() - start_time
+print("\nRender complete (with audio).")
+print("Output written to:", VIDEO_OUT)
+print(f"Total time: {elapsed_total / 60:.2f} min")
