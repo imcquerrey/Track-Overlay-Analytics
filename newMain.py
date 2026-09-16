@@ -5,254 +5,30 @@ import numpy as np
 import pandas as pd
 import cv2
 
-# ============================================================
-# USER CONFIG (things you actually change)
-# ============================================================
+from track_overlay.drawing import (
+    LINE_DRAW, FS, S, TH, alpha_blend, draw_bar, draw_center, draw_panel_roi,
+    draw_rpm_bar, draw_tile, draw_tile_fuel, draw_bottom_right, panel_rgba,
+    put_text, rect_fill, rect_outline, text_size,
+)
+from track_overlay.data_marks import load_data_marks
+from track_overlay.math_utils import (
+    _match_speed_window_fft, _next_pow2, _project_point_to_polyline_m,
+    _project_point_to_polyline_windowed_m, _resample_interp, _unwrap_near, _zscore,
+)
+from track_overlay.racechrono import _load_racechrono_csv
+from track_overlay.telemetry import detect_scale, kelvin_to_f, kpa_to_psi, pick, psi_abs_to_psig, series_num
+from track_overlay.timecode import _fmt_laptime, _fmt_mmss_mmm, _mmss_or_ss_to_s, _mmss_to_s, time_to_seconds
+from track_overlay.tires import draw_tire_icon, draw_tires, tire_temp_to_color
+from track_overlay.video_io import probe_video_props, start_ffmpeg_frame_reader
 
-# --- Input / Output ---
-NUMS = ["GX010055", "GX010056"]
+from track_overlay.settings import *
 
-NUM = NUMS[0]  # base name for your per-session files (e.g. 2.mp4 + 2.csv)
-
-VIDEO_IN = f"{NUM}.mp4"  # input video
-CSV_IN = f"{NUM}.csv"  # main telemetry CSV used by the overlay
-LAP_CSV_IN = "session_20251220_093244_grange_v3.csv"  # RaceChrono export that contains GPS + lap info
-VIDEO_OUT = f"{NUM}Final.mp4"  # output video
-
-# --- Quick test mode ---
-TEST_RENDER_FIRST_10S = False  # True: render only first TEST_DURATION_S seconds
-TEST_DURATION_S = 120
-
-# --- Audio trim nudge (seconds) ---
-# If audio is still a hair late/early after the fix, tweak this:
-#   +0.050 = delay audio 50ms
-#   -0.050 = advance audio 50ms
-AUDIO_TRIM_NUDGE_S = 0.0
-
-# --- Encoder (scrub-friendly) ---
-# 1.0 = force a keyframe about every second (fast scrubbing).
-# Smaller = more keyframes (bigger file). Larger = fewer keyframes (smaller file but slower scrubbing).
-SCRUB_KEYFRAME_EVERY_S = 1.0
-
-# --- Optional small-file output mode ---
-# Keeps the detected input resolution unchanged while using the same capped-
-# bitrate H.264/AAC compression profile used for the standalone compressed clips.
-COMPRESS_OUTPUT = True
-COMPRESS_VIDEO_BITRATE = "7M"
-COMPRESS_VIDEO_BUFFER_SIZE = "14M"
-COMPRESS_AUDIO_BITRATE = "128k"
-COMPRESS_NVENC_PRESET = "p6"
-COMPRESS_X264_PRESET = "medium"
-
-# --- Minimap ---
-
-# --- Minimap dot smoothing (pixel-space) ---
-MINIMAP_DOT_MAX_PX_STEP = 8.0  # max dot movement per frame in minimap pixels (prevents teleports)
-MINIMAP_DOT_MIN_PX_STEP = 0.0  # set to ~0.8 if you want to avoid subpixel 'stalls'
-MINIMAP_DOT_SMOOTH_ALPHA = 0.25
-MINIMAP_DOT_STALL_EPS_PX = 0.15
-
-MINIMAP_ENABLE = True
-MINIMAP_POS = "topleft"  # topleft / topright / bottomleft / bottomright
-
-# Minimap dot stability (prevents rare "teleport" snaps at hairpins / S-F)
-# Smaller SEARCH_WINDOW_SEGS reduces the chance of snapping to a nearby parallel segment.
-MINIMAP_DOT_SEARCH_WINDOW_SEGS = 90  # segments to search around last known segment (circular)
-MINIMAP_DOT_MAX_JUMP_M = 25.0  # hard gate: max meters the dot may move in one frame
-MINIMAP_DOT_MAX_STEP_PROG = 0.06  # gate on along-track progress step (0..1), cyclic (higher = more permissive)
-MINIMAP_MAX_LATERAL_JUMP_M = 1.5  # hard cap on cross-track jump (m) to prevent parallel-segment flips
-MINIMAP_CONFIRM_STREAK = 6  # frames required to accept a large lateral move
-MINIMAP_CONFIRM_LATERAL_M = 1.5  # lateral threshold (m) for debounce
-MINIMAP_CONFIRM_JUMP_M = 6.0  # total jump threshold (m) for debounce
-
-# --- Virtual splits (recommended) ---
-VIRTUAL_SPLITS_ENABLE = True
-VIRTUAL_SPLITS_N = 6  # 3 / 4 / 6 / 8 etc.
-VIRTUAL_SPLITS_RUNNING = True  # True: show a running delta inside the current sector
-# Running-split sanity clamp: if delta goes insane early in lap, it's almost always a progress wrap/glitch.
-SPLIT_SANITY_MAX_ABS_S = 10.0   # if |split| exceeds this, rebase progress for running split
-SPLIT_SANITY_MAX_LAP_T_S = 25.0 # only apply rebasing within first N seconds of a lap
-
-# --- Tire temperature color configuration (deg F) ---
-# Blue -> Green (optimal) -> Yellow (warm) -> Red (hot)
-# FRONT tires (TPMS valve-stem based)
-FRONT_TIRE_TEMP_COLD_F = 110.0
-FRONT_TIRE_TEMP_GREEN_LOW_F = 120.0
-FRONT_TIRE_TEMP_GREEN_HIGH_F = 135.0
-FRONT_TIRE_TEMP_YELLOW_LOW_F = 145.0
-FRONT_TIRE_TEMP_YELLOW_HIGH_F = 160.0
-FRONT_TIRE_TEMP_HOT_F = 175.0
-# REAR tires
-REAR_TIRE_TEMP_COLD_F = 105.0
-REAR_TIRE_TEMP_GREEN_LOW_F = 115.0
-REAR_TIRE_TEMP_GREEN_HIGH_F = 130.0
-REAR_TIRE_TEMP_YELLOW_LOW_F = 140.0
-REAR_TIRE_TEMP_YELLOW_HIGH_F = 155.0
-REAR_TIRE_TEMP_HOT_F = 170.0
-
-# --- Master UI scale ---
-UI_SCALE = 1.5  # 1.0 = original size
-
-DEBUG_PRINTS = False
-
-# ============================================================
-
-# --- Speed knobs (no visible quality loss for most UI) ---
-FAST_NO_AA = True  # True: use LINE_8 for shapes (faster). Text is still anti-aliased.
-LINE_DRAW = cv2.LINE_8 if FAST_NO_AA else cv2.LINE_AA
-
-# -------------------- FAST TEXT CACHE --------------------
-# cv2.putText is expensive per-frame. We cache rendered glyph bitmaps and blit them.
-_TEXT_CACHE = {}
-
-# allowed filenames
-
-results = {}
-
-with open("dataMarks.txt", "r") as f:
-    for line in f:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        parts = line.split("|")
-        if len(parts) != 6:
-            raise ValueError(f"Invalid format: {line}")
-
-        file_name, trim_start, trim_end, video_sync_mmss, log_sync_mmss, fine_tune_ms = parts
-
-        if file_name not in NUMS:
-            continue
-
-        results[file_name] = {
-            "VIDEO_TRIM_START_S": trim_start,
-            "VIDEO_TRIM_END_S": trim_end,
-            "VIDEO_SYNC_AT_MMSS": video_sync_mmss,
-            "LOG_SYNC_AT_MMSS": log_sync_mmss,
-            "SYNC_FINE_TUNE_MS": int(fine_tune_ms),
-        }
+results = load_data_marks("dataMarks.txt", NUMS)
 
 # --- Trim (SOURCE video time) ---
 # Leave VIDEO_TRIM_END_MMSS=None to render to end of the source file.
 VIDEO_TRIM_START_MMSS = results[NUM]['VIDEO_TRIM_START_S']  # mm:ss
 VIDEO_TRIM_END_MMSS = results[NUM]['VIDEO_TRIM_END_S']  # mm:ss or None
-
-
-def put_text(img, text, org, fontFace, fontScale, color, thickness=1, lineType=LINE_DRAW, bottomLeftOrigin=False):
-    """
-    Drop-in replacement for cv2.putText with caching.
-    Matches cv2.putText signature and returns img.
-    org is the baseline-bottom-left point (unless bottomLeftOrigin=True).
-    """
-    if text is None:
-        return img
-    try:
-        s = str(text)
-    except Exception:
-        return img
-    if s == "":
-        return img
-
-    key = (s, fontFace, float(fontScale), tuple(int(c) for c in color), int(thickness), int(lineType),
-           bool(bottomLeftOrigin))
-    cached = _TEXT_CACHE.get(key)
-
-    if cached is None:
-        # compute text size
-        (tw, th), baseline = cv2.getTextSize(s, fontFace, fontScale, thickness)
-        pad = 4  # pixels
-        w = tw + pad * 2
-        h = th + baseline + pad * 2
-        patch = np.zeros((h, w, 3), dtype=np.uint8)
-
-        # draw text into patch (baseline at y = pad + th)
-        x0 = pad
-        y0 = pad + th
-        # outline first (black) for readability (slightly thicker)
-        outline_th = max(thickness + 2, 2)
-        cv2.putText(patch, s, (x0, y0), fontFace, fontScale, (0, 0, 0), outline_th, lineType, bottomLeftOrigin)
-        cv2.putText(patch, s, (x0, y0), fontFace, fontScale, color, thickness, lineType, bottomLeftOrigin)
-
-        alpha = (patch[:, :, 0] | patch[:, :, 1] | patch[:, :, 2]).astype(np.uint8)
-        # make alpha 0/255
-        alpha = np.where(alpha > 0, 255, 0).astype(np.uint8)
-        cached = (patch, alpha, pad, th)
-        _TEXT_CACHE[key] = cached
-
-    patch, alpha, pad, th = cached
-
-    x, y = int(org[0]), int(org[1])
-
-    # Convert baseline org -> top-left of patch
-    # baseline y = top + pad + th  => top = y - (pad + th)
-    top = y - (pad + th)
-    left = x - pad
-
-    H, W = img.shape[:2]
-    ph, pw = patch.shape[:2]
-    x0 = max(0, left)
-    y0 = max(0, top)
-    x1 = min(W, left + pw)
-    y1 = min(H, top + ph)
-    if x0 >= x1 or y0 >= y1:
-        return img
-
-    px0 = x0 - left
-    py0 = y0 - top
-    px1 = px0 + (x1 - x0)
-    py1 = py0 + (y1 - y0)
-
-    roi = img[y0:y1, x0:x1]
-    p = patch[py0:py1, px0:px1]
-    a = alpha[py0:py1, px0:px1]
-
-    mask = a > 0
-    # fast overwrite (opaque text pixels)
-    roi[mask] = p[mask]
-    return img
-
-
-# --- Derived times from USER CONFIG ---
-
-def _mmss_to_s(mmss):
-    if mmss is None:
-        return None
-    mm, ss = mmss.split(":")
-    return int(mm) * 60 + int(ss)
-
-
-def _mmss_or_ss_to_s(v):
-    """Parse 'm:ss', 'mm:ss', optionally with .mmm, or plain seconds string '20.4'."""
-    if v is None:
-        return None
-    if isinstance(v, (int, float)) and not (isinstance(v, float) and (v != v)):
-        return float(v)
-    s = str(v).strip()
-    if s == "" or s.lower() == "none":
-        return None
-    if re.match(r"^\d+(?:\.\d+)?$", s):
-        return float(s)
-    m = re.match(r"^(?P<m>\d+):(?P<s>\d{1,2})(?:\.(?P<ms>\d{1,3}))?$", s)
-    if not m:
-        raise ValueError(f"Bad time format: {v!r} (use seconds like 20.4 or m:ss(.mmm) like 0:20.400)")
-    mm = int(m.group("m"))
-    ss = int(m.group("s"))
-    ms = m.group("ms")
-    frac = 0.0
-    if ms is not None:
-        frac = int(ms.ljust(3, "0")) / 1000.0
-    return mm * 60.0 + ss + frac
-
-
-def _fmt_mmss_mmm(s: float) -> str:
-    """Format seconds as m:ss.mmm."""
-    if s is None:
-        return "None"
-    sign = "-" if s < 0 else ""
-    s = abs(float(s))
-    m = int(s // 60)
-    sec = s - m * 60
-    return f"{sign}{m}:{sec:06.3f}"
 
 
 VIDEO_TRIM_START_S = _mmss_to_s(VIDEO_TRIM_START_MMSS)
@@ -275,333 +51,7 @@ print(
 )
 
 
-def _fmt_mmss_mmm(s):
-    m = int(s // 60)
-    sec = s - m * 60
-    return f"{m}:{sec:06.3f}"
-
-
-# -------------------- Performance --------------------
-FAST_RENDER = True  # enable per-frame caching for speed (no quality drop)
-TEXT_UPDATE_HZ = 10.0  # update expensive text strings at this rate (Hz)
-
-# Units
-KPA_TO_PSI = 0.1450377377
-KPH_TO_MPH = 0.621371
-ATM_PSI = 14.6959
-
-
-def kpa_to_psi(v): return v * KPA_TO_PSI
-
-
-def psi_abs_to_psig(psi_abs): return psi_abs - ATM_PSI
-
-
-def kelvin_to_f(k): return (k - 273.15) * 9.0 / 5.0 + 32.0
-
-
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-
-
-def S(px): return int(round(px * UI_SCALE))
-
-
-def FS(f): return float(f * UI_SCALE)
-
-
-def TH(t): return max(1, int(round(t * UI_SCALE)))
-
-
-# -------------------- Text size cache (speed) --------------------
-_TEXTSZ = {}
-
-
-def text_size(txt, font, scale, thickness):
-    k = (txt, float(scale), int(thickness))
-    v = _TEXTSZ.get(k)
-    if v is None:
-        v = cv2.getTextSize(txt, font, scale, thickness)
-        _TEXTSZ[k] = v
-    return v
-
-
-def time_to_seconds(t):
-    if pd.isna(t):
-        return np.nan
-    s = str(t).strip()
-    m = re.match(r"^(?P<h>\d{2}):(?P<m>\d{2}):(?P<sec>\d{2})\.(?P<ms>\d+)$", s)
-    if not m:
-        return np.nan
-    ms = int(m.group("ms")[:3].ljust(3, "0"))
-    return int(m.group("h")) * 3600 + int(m.group("m")) * 60 + int(m.group("sec")) + ms / 1000.0
-
-
-def pick(columns, pattern):
-    for col in columns:
-        if re.search(pattern, col, re.I):
-            return col
-    return None
-
-
-def series_num(df, col):
-    return pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-
-
-def detect_scale(df, col, kind):
-    if col is None:
-        return 1.0
-    mx = float(np.nanmax(series_num(df, col)))
-    if not np.isfinite(mx):
-        return 1.0
-
-    if kind == "ign":
-        return 10.0 if mx > 100.0 else 1.0
-
-    if kind == "lambda":
-        if mx > 50 and mx <= 5000:
-            return 1000.0
-        if mx > 5 and mx <= 50:
-            return 10.0
-        if mx > 5000 and mx <= 50000:
-            return 10000.0
-        return 1.0
-
-    if mx >= 1000 and mx < 10000:
-        return 10.0
-    if mx >= 10000:
-        return 100.0
-    return 1.0
-
-
-def alpha_blend(dst, src_rgba, x, y):
-    """Fast uint8 alpha blend (no float32), for 4-channel src_rgba over BGR dst at (x,y)."""
-    h, w = src_rgba.shape[:2]
-    H, W = dst.shape[:2]
-    x0, y0 = max(0, int(x)), max(0, int(y))
-    x1, y1 = min(W, int(x) + int(w)), min(H, int(y) + int(h))
-    if x0 >= x1 or y0 >= y1:
-        return dst
-
-    roi = dst[y0:y1, x0:x1]
-    src = src_rgba[(y0 - int(y)):(y1 - int(y)), (x0 - int(x)):(x1 - int(x))]
-
-    # uint16 math: out = (roi*(255-a) + src_rgb*a)/255
-    a = src[..., 3:4].astype(np.uint16)  # 0..255
-    inv = (255 - a)
-    roi16 = roi.astype(np.uint16)
-    src16 = src[..., :3].astype(np.uint16)
-    out = (roi16 * inv + src16 * a + 127) // 255
-    roi[:] = out.astype(np.uint8)
-    return dst
-    roi = dst[y0:y1, x0:x1].astype(np.float32)
-    src = src_rgba[(y0 - y):(y1 - y), (x0 - x):(x1 - x)].astype(np.float32)
-    a = src[..., 3:4] / 255.0
-    roi = roi * (1 - a) + src[..., :3] * a
-    dst[y0:y1, x0:x1] = roi.astype(np.uint8)
-    return dst
-
-
-_PANEL_CACHE = {}
-
-
-# -------------------- ROI panel rendering (speed) --------------------
-def draw_panel_roi(frame, x, y, w, h, draw_fn, *args, **kwargs):
-    """Draw into a ROI VIEW (no copy). Fastest path: all drawing stays inside the smaller slice."""
-    H, W = frame.shape[:2]
-    x0 = max(0, int(x));
-    y0 = max(0, int(y))
-    x1 = min(W, x0 + int(w));
-    y1 = min(H, y0 + int(h))
-    if x1 <= x0 or y1 <= y0:
-        return
-    roi = frame[y0:y1, x0:x1]  # writable view
-    draw_fn(roi, *args, **kwargs)
-
-
-def panel_rgba(w, h, alpha=110, shade=0):
-    """Small perf win: cache frequently used solid RGBA panels."""
-    key = (int(w), int(h), int(alpha), int(shade))
-    p = _PANEL_CACHE.get(key)
-    if p is None:
-        p = np.zeros((key[1], key[0], 4), dtype=np.uint8)
-        p[..., 0] = key[3]
-        p[..., 1] = key[3]
-        p[..., 2] = key[3]
-        p[..., 3] = key[2]
-        _PANEL_CACHE[key] = p
-    return p
-
-
-def rect_fill(frame, x1, y1, x2, y2, color):
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, -1, cv2.LINE_8)
-
-
-def rect_outline(frame, x1, y1, x2, y2, color=(255, 255, 255), thickness=1):
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, TH(thickness), cv2.LINE_8)
-
-
-def draw_tile(frame, x, y, w, h, label, value, value_scale=0.70):
-    rect_fill(frame, x, y, x + w, y + h, (18, 18, 18))
-    rect_outline(frame, x, y, x + w, y + h, (255, 255, 255), 1)
-    put_text(frame, label, (x + S(12), y + S(20)), FONT, FS(0.40), (210, 210, 210), TH(1), LINE_DRAW)
-    put_text(frame, value, (x + S(12), y + h - S(10)), FONT, FS(value_scale), (255, 255, 255), TH(2), LINE_DRAW)
-
-
-def draw_tile_fuel(frame, x, y, w, h, label, psi_text, pct_text):
-    rect_fill(frame, x, y, x + w, y + h, (18, 18, 18))
-    rect_outline(frame, x, y, x + w, y + h, (255, 255, 255), 1)
-    put_text(frame, label, (x + S(12), y + S(20)), FONT, FS(0.40), (210, 210, 210), TH(1), LINE_DRAW)
-    if pct_text:
-        (tw, _), _ = text_size(pct_text, FONT, FS(0.35), TH(1))
-        put_text(frame, pct_text, (x + w - S(12) - tw, y + S(20)), FONT, FS(0.35), (210, 210, 210), TH(1),
-                 LINE_DRAW)
-    put_text(frame, psi_text, (x + S(12), y + h - S(10)), FONT, FS(0.66), (255, 255, 255), TH(2), LINE_DRAW)
-
-
-def draw_bar(frame, pct, x, y, w, h, fill_bgr):
-    rect_fill(frame, x, y, x + w, y + h, (12, 12, 12))
-    rect_outline(frame, x, y, x + w, y + h, (255, 255, 255), 1)
-    v = float(np.clip(pct, 0, 100))
-    fh = int((h - S(8)) * (v / 100.0))
-    cv2.rectangle(frame, (x + S(4), y + h - S(4) - fh), (x + w - S(4), y + h - S(4)), fill_bgr, -1, LINE_DRAW)
-
-
-def draw_rpm_bar(frame, rpm, x, y, w, h, rpm_max=8000, red_start=7000):
-    rect_fill(frame, x, y, x + w, y + h, (12, 12, 12))
-    rect_outline(frame, x, y, x + w, y + h, (255, 255, 255), 1)
-    inner_x = x + S(8);
-    inner_y = y + S(8)
-    inner_w = w - S(16);
-    inner_h = h - S(16)
-    rs = int(inner_x + inner_w * (red_start / rpm_max))
-    rect_fill(frame, inner_x, inner_y, rs, inner_y + inner_h, (40, 40, 40))
-    rect_fill(frame, rs, inner_y, inner_x + inner_w, inner_y + inner_h, (0, 0, 255))
-    rpm = float(np.clip(rpm, 0, rpm_max))
-    px = int(inner_x + inner_w * (rpm / rpm_max))
-    rect_fill(frame, inner_x, inner_y, px, inner_y + inner_h, (235, 235, 235))
-    for r in range(0, rpm_max + 1, 500):
-        tx = int(inner_x + inner_w * (r / rpm_max))
-        major = (r % 1000 == 0)
-        tick_h = inner_h if major else int(inner_h * 0.55)
-        col = (0, 0, 0) if tx < px else (255, 255, 255)
-        cv2.line(frame, (tx, inner_y + inner_h), (tx, inner_y + inner_h - tick_h), col, TH(2 if major else 1),
-                 LINE_DRAW)
-        if major and r > 0:
-            label = str(r // 1000)
-            (tw, _), _ = text_size(label, FONT, FS(0.5), TH(1))
-            put_text(frame, label, (tx - tw // 2, y - S(6)), FONT, FS(0.5), (255, 255, 255), TH(1), LINE_DRAW)
-
-
-def draw_center(frame, x, y, w, h, rpm_txt, mph_txt, gear_txt, ign_txt, knock_txt):
-    alpha_blend(frame, panel_rgba(w, h, alpha=110, shade=0), x, y)
-    rect_outline(frame, x, y, x + w, y + h, (255, 255, 255), 1)
-
-    put_text(frame, rpm_txt, (x + S(12), y + S(34)), FONT, FS(0.95), (255, 255, 255), TH(2), LINE_DRAW)
-    put_text(frame, "RPM", (x + S(12), y + S(54)), FONT, FS(0.45), (210, 210, 210), TH(1), LINE_DRAW)
-
-    (mw, _), _ = text_size(mph_txt, FONT, FS(0.95), TH(2))
-    put_text(frame, mph_txt, (x + w - S(12) - mw, y + S(34)), FONT, FS(0.95), (255, 255, 255), TH(2), LINE_DRAW)
-    (lw, _), _ = text_size("MPH", FONT, FS(0.45), TH(1))
-    put_text(frame, "MPH", (x + w - S(12) - lw, y + S(54)), FONT, FS(0.45), (210, 210, 210), TH(1), LINE_DRAW)
-
-    (tw, th), _ = text_size(gear_txt, FONT, FS(2.4), TH(4))
-    cx = x + w // 2;
-    cy = y + h // 2
-    put_text(frame, gear_txt, (cx - tw // 2, cy + th // 2 + S(10)), FONT, FS(2.4), (255, 255, 255), TH(4),
-             LINE_DRAW)
-
-    (gw, _), _ = text_size("GEAR", FONT, FS(0.55), TH(2))
-    put_text(frame, "GEAR", (cx - gw // 2, cy + th // 2 + S(34)), FONT, FS(0.55), (210, 210, 210), TH(2),
-             LINE_DRAW)
-
-    put_text(frame, ign_txt, (x + S(12), y + h - S(28)), FONT, FS(0.45), (210, 210, 210), TH(1), LINE_DRAW)
-    put_text(frame, knock_txt, (x + S(12), y + h - S(10)), FONT, FS(0.45), (210, 210, 210), TH(1), LINE_DRAW)
-
-
-def tire_temp_to_color(temp_f, axle="front"):
-    if not np.isfinite(temp_f):
-        return (120, 120, 120)
-
-    if axle.lower().startswith("r"):
-        cold = float(REAR_TIRE_TEMP_COLD_F)
-        g_lo = float(REAR_TIRE_TEMP_GREEN_LOW_F)
-        g_hi = float(REAR_TIRE_TEMP_GREEN_HIGH_F)
-        y_lo = float(REAR_TIRE_TEMP_YELLOW_LOW_F)
-        y_hi = float(REAR_TIRE_TEMP_YELLOW_HIGH_F)
-        hot = float(REAR_TIRE_TEMP_HOT_F)
-    else:
-        cold = float(FRONT_TIRE_TEMP_COLD_F)
-        g_lo = float(FRONT_TIRE_TEMP_GREEN_LOW_F)
-        g_hi = float(FRONT_TIRE_TEMP_GREEN_HIGH_F)
-        y_lo = float(FRONT_TIRE_TEMP_YELLOW_LOW_F)
-        y_hi = float(FRONT_TIRE_TEMP_YELLOW_HIGH_F)
-        hot = float(FRONT_TIRE_TEMP_HOT_F)
-
-    g_lo = max(g_lo, cold)
-    g_hi = max(g_hi, g_lo + 1e-6)
-    y_lo = max(y_lo, g_hi)
-    y_hi = max(y_hi, y_lo + 1e-6)
-    hot = max(hot, y_hi + 1e-6)
-
-    if temp_f <= g_lo:
-        denom = max(g_lo - cold, 1e-6)
-        r = float(np.clip((temp_f - cold) / denom, 0.0, 1.0))
-        b = int(255 * (1 - r))
-        g = int(255 * r)
-        return (b, g, 0)
-
-    if temp_f <= g_hi:
-        return (0, 255, 0)
-
-    if temp_f < y_lo:
-        denom = max(y_lo - g_hi, 1e-6)
-        r = float(np.clip((temp_f - g_hi) / denom, 0.0, 1.0))
-        rr = int(255 * r)
-        return (0, 255, rr)
-
-    if temp_f <= y_hi:
-        return (0, 255, 255)
-
-    denom = max(hot - y_hi, 1e-6)
-    r = float(np.clip((temp_f - y_hi) / denom, 0.0, 1.0))
-    g = int(255 * (1 - r))
-    rr = 255
-    return (0, g, rr)
-
-
-def draw_tire_icon(frame, cx, cy, w, h, fill_bgr, psi_text):
-    x1, y1 = int(cx - w / 2), int(cy - h / 2)
-    x2, y2 = int(cx + w / 2), int(cy + h / 2)
-    rect_fill(frame, x1, y1, x2, y2, fill_bgr)
-    rect_outline(frame, x1, y1, x2, y2, (255, 255, 255), 1)
-    inset = int(0.20 * min(w, h))  # w/h already scaled; don't scale inset again
-    rect_fill(frame, x1 + inset, y1 + inset, x2 - inset, y2 - inset, (25, 25, 25))
-    (tw, th), _ = text_size(psi_text, FONT, FS(0.55), TH(2))
-    put_text(frame, psi_text, (int(cx - tw / 2), int(cy + th / 2)), FONT, FS(0.55), (255, 255, 255), TH(2),
-             LINE_DRAW)
-
-
-def draw_tires(frame, vals, x, y, scale_temp, scale_tire_p):
-    tw, th = S(76), S(120)
-    gap_x, gap_y = S(22), S(18)
-    grid = [
-        ("t_fl", "p_fl", x, y),
-        ("t_fr", "p_fr", x + tw + gap_x, y),
-        ("t_rl", "p_rl", x, y + th + gap_y),
-        ("t_rr", "p_rr", x + tw + gap_x, y + th + gap_y)
-    ]
-    for tk, pk, px, py in grid:
-        t_raw = vals.get(tk, np.nan);
-        p_raw = vals.get(pk, np.nan)
-        t_k = (t_raw / scale_temp) if np.isfinite(t_raw) else np.nan
-        t_f = kelvin_to_f(t_k) if np.isfinite(t_k) else np.nan
-        color = tire_temp_to_color(t_f, axle=('rear' if tk in ('t_rl', 't_rr') else 'front'))
-        p_kpa_abs = (p_raw / scale_tire_p) if np.isfinite(p_raw) else np.nan
-        p_psi_abs = kpa_to_psi(p_kpa_abs) if np.isfinite(p_kpa_abs) else np.nan
-        p_psig = psi_abs_to_psig(p_psi_abs) if np.isfinite(p_psi_abs) else np.nan
-        if np.isfinite(p_psig): p_psig = max(0.0, p_psig)
-        psi_text = f"{p_psig:0.1f}" if np.isfinite(p_psig) else "--"
-        draw_tire_icon(frame, px + tw / 2, py + th / 2, tw, th, color, psi_text)
 
 
 def draw_lap_panel(frame, lap_time_s, prev_lap_s, sess_best_s, split_s, lat_g, lon_g, txt_cache=None):
@@ -762,37 +212,6 @@ def draw_lap_panel(frame, lap_time_s, prev_lap_s, sess_best_s, split_s, lat_g, l
              LINE_DRAW)
     put_text(frame, lon_str, (xg + S2(12), yg0 + S2(30) + 2 * line_h), FONT, FS2(0.46), (210, 210, 210), TH2(1),
              LINE_DRAW)
-
-
-def draw_bottom_right(frame, data, x, y, w, h):
-    alpha_blend(frame, panel_rgba(w, h, alpha=110, shade=0), x, y)
-    rect_outline(frame, x, y, x + w, y + h, (255, 255, 255), 1)
-    pad = S(10);
-    left_w = S(150);
-    right_w = S(150)
-    tile_h = S(54);
-    gap = S(10)
-    stack_h = 4 * tile_h + 3 * gap
-    base_center_w = w - left_w - right_w - 2 * pad
-    center_w = int(base_center_w * 0.80)
-    total_used = left_w + pad + center_w + pad + right_w
-    start_x = x + (w - total_used) // 2
-    stack_y = y + (h - stack_h) // 2
-    lx = start_x;
-    cx0 = lx + left_w + pad;
-    rx = cx0 + center_w + pad
-
-    draw_center(frame, cx0, stack_y, center_w, stack_h, data["rpm"], data["mph"], data["gear"], data["ign"],
-                data["knock"])
-    draw_tile(frame, lx, stack_y + 0 * (tile_h + gap), left_w, tile_h, "CLT", data["clt"])
-    draw_tile(frame, lx, stack_y + 1 * (tile_h + gap), left_w, tile_h, "OIL", data["oil"])
-    draw_tile(frame, lx, stack_y + 2 * (tile_h + gap), left_w, tile_h, "IAT", data["iat"])
-    draw_tile(frame, lx, stack_y + 3 * (tile_h + gap), left_w, tile_h, "MAP", data["map"])
-    draw_tile(frame, rx, stack_y + 0 * (tile_h + gap), right_w, tile_h, "TPS", data["tps"])
-    draw_tile_fuel(frame, rx, stack_y + 1 * (tile_h + gap), right_w, tile_h, "Fuel Pres", data["fuel_psi"],
-                   data["fuel_pct"])
-    draw_tile(frame, rx, stack_y + 2 * (tile_h + gap), right_w, tile_h, "WB1/WB2", data["wb"], value_scale=0.62)
-    draw_tile(frame, rx, stack_y + 3 * (tile_h + gap), right_w, tile_h, "Lambda Target", data["lt"], value_scale=0.62)
 
 
 # -------------------- Load CSV --------------------
@@ -1076,68 +495,6 @@ if not cap.isOpened():
 import subprocess, shutil, os, json, math
 
 
-def probe_video_props(path):
-    ffprobe = shutil.which("ffprobe")
-    if not ffprobe:
-        return None
-    cmd = [
-        ffprobe, "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate",
-        "-of", "json", path
-    ]
-    try:
-        out = subprocess.check_output(cmd)
-        j = json.loads(out)
-        s = j["streams"][0]
-
-        def parse_rate(r):
-            if not r or r == "0/0" or r == "0/1":
-                return 0.0
-            num, den = r.split("/")
-            den = float(den)
-            return float(num) / den if den else 0.0
-
-        return {
-            "W": int(s.get("width", 0) or 0),
-            "H": int(s.get("height", 0) or 0),
-            "fps_avg": parse_rate(s.get("avg_frame_rate", "0/1")),
-            "fps_r": parse_rate(s.get("r_frame_rate", "0/1")),
-        }
-    except Exception:
-        return None
-
-
-def start_ffmpeg_frame_reader(video_in: str, W: int, H: int, fps: float, start_s: float):
-    """Decode frames with ffmpeg and stream raw BGR24 frames to Python (faster/more reliable than OpenCV on Windows)."""
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise SystemExit("ffmpeg not found on PATH. Install it (e.g. winget install Gyan.FFmpeg).")
-
-    # -ss before -i for fast seek; good enough for overlay work
-    cmd = [
-        ffmpeg, "-hide_banner", "-loglevel", "error",
-        "-ss", f"{start_s:.6f}",
-        "-i", video_in,
-        "-map", "0:v:0",
-        "-an", "-sn", "-dn",
-        "-vf", f"fps={fps:.9f}",
-        "-pix_fmt", "bgr24",
-        "-f", "rawvideo",
-        "pipe:1",
-    ]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=10 ** 7)
-    frame_bytes = int(W) * int(H) * 3
-
-    def read_frame():
-        buf = p.stdout.read(frame_bytes)
-        if not buf or len(buf) < frame_bytes:
-            return None
-        return np.frombuffer(buf, dtype=np.uint8).reshape((H, W, 3)).copy()
-
-    return p, read_frame
-
-
 fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
 W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
 H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -1240,92 +597,6 @@ if TEST_RENDER_FIRST_10S:
 # We align the RaceChrono "day CSV" to the Haltech log by matching MPH shape (normalized cross-correlation).
 # Then we sample lap_time + lateral/longitudinal g for the video window.
 RACECHRONO_MPS_TO_MPH = 2.2369362920544
-
-
-def _load_racechrono_csv(path):
-    # RaceChrono has a small text header then a CSV header line starting with "timestamp,"
-    header_idx = None
-    with open(path, "r", errors="ignore") as f:
-        for i, line in enumerate(f):
-            if line.lower().startswith("timestamp,"):
-                header_idx = i
-                break
-    if header_idx is None:
-        raise SystemExit(f"Could not find RaceChrono header row in: {path}")
-
-    df = pd.read_csv(path, skiprows=header_idx, engine="python")
-    # First 2 rows after header are units/source rows (non-numeric "timestamp")
-    df["timestamp_num"] = pd.to_numeric(df["timestamp"], errors="coerce")
-    df = df.loc[np.isfinite(df["timestamp_num"])].copy()
-
-    # Pick speed column (RaceChrono sometimes has duplicates like speed & speed.1)
-    speed_col = "speed.1" if "speed.1" in df.columns else ("speed" if "speed" in df.columns else None)
-    if speed_col is None:
-        raise SystemExit("RaceChrono CSV missing speed column.")
-
-    def col_or_none(name):
-        return name if name in df.columns else None
-
-    out = {
-        "t_unix": pd.to_numeric(df["timestamp_num"], errors="coerce").to_numpy(dtype=np.float64),
-        "speed_mph": pd.to_numeric(df[speed_col], errors="coerce").to_numpy(dtype=np.float64) * RACECHRONO_MPS_TO_MPH,
-        "lap_number": pd.to_numeric(df.get("lap_number", np.nan), errors="coerce").to_numpy(dtype=np.float64),
-        "lat_g": pd.to_numeric(df.get("lateral_acc", np.nan), errors="coerce").to_numpy(dtype=np.float64),
-        "lon_g": pd.to_numeric(df.get("longitudinal_acc", np.nan), errors="coerce").to_numpy(dtype=np.float64),
-        # GPS position (if present in export)
-        "gps_lat": pd.to_numeric(df.get("latitude", np.nan), errors="coerce").to_numpy(dtype=np.float64),
-        "gps_lon": pd.to_numeric(df.get("longitude", np.nan), errors="coerce").to_numpy(dtype=np.float64),
-    }
-    # Basic cleanup
-    m = np.isfinite(out["t_unix"]) & np.isfinite(out["speed_mph"])
-    for k in out:
-        out[k] = out[k][m]
-    return out
-
-
-def _next_pow2(n):
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
-
-
-def _zscore(x):
-    x = np.asarray(x, dtype=np.float64)
-    m = float(np.nanmean(x))
-    s = float(np.nanstd(x))
-    if not np.isfinite(s) or s < 1e-9:
-        return x * 0.0
-    return (x - m) / s
-
-
-def _resample_interp(t_src, y_src, t_dst):
-    # np.interp requires increasing t
-    return np.interp(t_dst, t_src, y_src, left=y_src[0], right=y_src[-1])
-
-
-def _match_speed_window_fft(speed_big, speed_small):
-    # Returns best start index in speed_big where speed_small matches.
-    a = _zscore(speed_big)
-    b = _zscore(speed_small)
-    n = len(b)
-    m = len(a)
-    if n < 10 or m < n + 10:
-        return 0
-
-    # Convolution for sliding dot product: dot(i) = sum a[i:i+n] * b
-    # Use FFT of a and reversed(b)
-    size = _next_pow2(m + n - 1)
-    fa = np.fft.rfft(a, size)
-    fb = np.fft.rfft(b[::-1], size)
-    conv = np.fft.irfft(fa * fb, size)
-
-    # valid i corresponds to conv[i + n - 1]
-    dots = conv[(n - 1):(m)]
-    # Only keep valid starts: i in [0, m-n]
-    dots = dots[: (m - n + 1)]
-    i0 = int(np.argmax(dots))
-    return i0
 
 
 # Build lap sync mapping (t_sample in Haltech "seconds of day") -> RaceChrono unix timestamp
@@ -1714,8 +985,6 @@ _split_prev_t_s = np.nan
 _split_run_prev_p = np.nan
 
 
-
-
 def _reset_virtual_splits():
     global _split_next_idx, _split_last_idx, _split_last_delta_s, _split_prev_rel_p, _split_prev_t_s, _split_run_prev_p
     _split_next_idx = 1
@@ -1793,7 +1062,6 @@ def _update_virtual_splits(rel_p, lap_time_s):
     return _split_last_idx, _split_last_delta_s
 
 
-
 def _filter_running_rel_p(rel_p: float, speed_mps: float, dt_s: float) -> float:
     """Make rel_p (0..1 within lap) monotonic-ish and rate-limited to avoid split delta spikes.
     This only affects the *displayed running split*; lap timing / boundaries remain unchanged.
@@ -1859,38 +1127,6 @@ def _build_centerline_progress():
     _split_center_total_m = total
     _split_center_prog = (cum / total).astype(np.float64)
     _prog_hint_seg = None
-
-
-def _project_point_to_polyline_windowed_m(p_m, poly_m, seg_hint=None, window=120):
-    """Project p_m (meters) onto polyline poly_m (Nx2 meters).
-    If seg_hint is provided, restrict search to +-window segments around seg_hint (circular).
-    Returns (proj_xy, seg_idx, t) where seg_idx is 0..n-2 and t is [0..1] within that segment.
-    """
-    p = np.asarray(p_m, dtype=np.float64)
-    pts = np.asarray(poly_m, dtype=np.float64)
-    n = int(len(pts))
-    if n < 2:
-        return (pts[0] if n == 1 else p), 0, 0.0
-
-    seg_n = n - 1
-    if seg_hint is None:
-        cand = np.arange(seg_n, dtype=np.int32)
-    else:
-        w = int(max(5, window))
-        deltas = np.arange(-w, w + 1, dtype=np.int32)
-        cand = (int(seg_hint) + deltas) % seg_n
-
-    a = pts[cand]
-    b = pts[cand + 1]
-    ab = b - a
-    ap = p - a
-    ab_len2 = np.sum(ab * ab, axis=1) + 1e-12
-    t = np.clip(np.sum(ap * ab, axis=1) / ab_len2, 0.0, 1.0)
-    proj = a + (ab * t[:, None])
-    d2 = np.sum((proj - p) ** 2, axis=1)
-    k = int(np.argmin(d2))
-    seg_idx = int(cand[k])
-    return proj[k], seg_idx, float(t[k])
 
 
 def _progress_from_gps(lat_deg, lon_deg, t_unix=None, speed_mps=None):
@@ -2071,7 +1307,6 @@ def _progress_from_gps(lat_deg, lon_deg, t_unix=None, speed_mps=None):
     return float(prog)
 
 
-
 # --- Minimap dot: RaceChrono-only progress with short predictive hold ---
 # Uses RaceChrono GPS projection for progress (same basis as reference lap), but when GPS projection is temporarily rejected
 # (close-parallel flips, multipath), it will predict forward briefly using speed to avoid a visible freeze, while clamping
@@ -2117,12 +1352,6 @@ _fused_centerline_ok_count = 0
 _fused_locked = False
 _fused_lock_t0 = None
 _fused_last_gps_p = None
-
-
-def _unwrap_near(x, ref):
-    """Return x (possibly +/-1) that is closest to ref."""
-    cands = (x, x + 1.0, x - 1.0)
-    return min(cands, key=lambda v: abs(v - ref))
 
 
 def _progress_fused(lat_deg, lon_deg, t_unix=None, speed_mps=None):
@@ -2354,7 +1583,6 @@ def _progress_minimap_rc_hold(lat_deg, lon_deg, t_unix, speed_mps):
     return float(_minimap_rc_disp_p)
 
 
-
 def _slice_lap_samples(t0, t1):
     # returns indices in lap_t for [t0, t1]
     i0 = int(np.searchsorted(lap_t, t0, side="left"))
@@ -2413,25 +1641,6 @@ def _make_split_reference(t0, t1):
         ref_p = np.append(ref_p, 1.0)
         ref_t = np.append(ref_t, float(ref_t[-1]))
     _split_ref_prog, _split_ref_time = ref_p, ref_t
-
-
-def _project_point_to_polyline_m(p_m, poly_m):
-    # Returns closest point on polyline to p_m (both in meters), and its index.
-    p = np.asarray(p_m, dtype=np.float64)
-    pts = np.asarray(poly_m, dtype=np.float64)
-    if len(pts) < 2:
-        return pts[0] if len(pts) == 1 else p, 0
-
-    a = pts[:-1]
-    b = pts[1:]
-    ab = b - a
-    ap = p - a
-    ab_len2 = np.sum(ab * ab, axis=1) + 1e-12
-    t = np.clip(np.sum(ap * ab, axis=1) / ab_len2, 0.0, 1.0)
-    proj = a + (ab * t[:, None])
-    d2 = np.sum((proj - p) ** 2, axis=1)
-    i = int(np.argmin(d2))
-    return proj[i], i
 
 
 def _minimap_dot_xy(lat_deg, lon_deg):
@@ -2787,15 +1996,6 @@ def prev_full_lap(t_unix):
         else:
             break
     return prev
-
-
-def _fmt_laptime(sec):
-    if not np.isfinite(sec):
-        return "--:--.---"
-    sec = float(max(0.0, sec))
-    m = int(sec // 60.0)
-    s = sec - 60.0 * m
-    return f"{m:d}:{s:06.3f}"
 
 
 def lap_at_time(t_sample, t_out_s):

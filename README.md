@@ -54,7 +54,8 @@ ffprobe -version
 | `GX010056.csv` | Second named telemetry fixture |
 | `session_20251220_093244_grange_v3.csv` | RaceChrono GPS and lap-session export shared by the fixtures |
 | `dataMarks.txt` | Per-session trim and synchronization anchors |
-| `newMain.py` | Overlay renderer and user configuration |
+| `newMain.py` | Executable render pipeline and stateful minimap/split logic |
+| `track_overlay/` | Shared configuration, parsing, math, media, telemetry, and drawing modules |
 
 The media files are large because they retain the 3840x2160 source resolution and audio needed to exercise the real decode, overlay, and encode pipeline.
 
@@ -87,11 +88,29 @@ GX010055|0:00|1:40|0:20.400|4:04.560|900
 GX010056|0:00|1:40|0:20.400|4:04.560|900
 ```
 
-Keep synchronization anchors tied to a clearly identifiable event visible in the video and present in the telemetry log. The shared RaceChrono filename and the rendering, minimap, virtual-split, temperature, compression, and UI-scale options are configured near the top of `newMain.py`.
+Keep synchronization anchors tied to a clearly identifiable event visible in the video and present in the telemetry log. The shared RaceChrono filename and the rendering, minimap, virtual-split, temperature, compression, and UI-scale options are configured in `track_overlay/settings.py`.
+
+## Code structure
+
+`newMain.py` remains the executable entry point and intentionally retains the stateful render loop, minimap tracking, virtual-split state, and FFmpeg encoder lifecycle. The supporting `track_overlay` package separates the reusable concerns that feed that loop:
+
+| Module | Responsibility |
+| --- | --- |
+| `settings.py` | User-editable session, encoding, minimap, split, and UI configuration |
+| `data_marks.py` | Parsing `dataMarks.txt` trim and synchronization records |
+| `timecode.py` | Time parsing and display formatting |
+| `telemetry.py` | Channel selection, numeric scaling, and unit conversion |
+| `drawing.py` | Text caching, compositing primitives, gauges, and dashboard layout |
+| `tires.py` | Tire temperature/pressure conversion and drawing |
+| `video_io.py` | `ffprobe` metadata and raw FFmpeg frame decoding |
+| `racechrono.py` | RaceChrono GPS, speed, lap, and acceleration loading |
+| `math_utils.py` | FFT synchronization and minimap polyline projection math |
+
+The current baseline still renders only `NUMS[0]`. Moving mutable render state behind a per-session execution boundary and processing the complete `NUMS` list remain future work.
 
 ## Short test renders
 
-Before a full render, set `TEST_RENDER_FIRST_10S = True` and reduce `TEST_DURATION_S` in `newMain.py`. This limits output duration while exercising the same decoding, overlay, audio, and encoding pipeline. Generated media should not be committed.
+Before a full render, set `TEST_RENDER_FIRST_10S = True` and reduce `TEST_DURATION_S` in `track_overlay/settings.py`. This limits output duration while exercising the same decoding, overlay, audio, and encoding pipeline. Generated media should not be committed.
 
 ## License
 
